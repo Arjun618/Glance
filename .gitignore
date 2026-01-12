@@ -1,0 +1,11 @@
+# Ignore all contents of data/
+data/*
+
+# But keep the data directory itself
+!data/
+
+# pycache
+__pycache__/
+
+# test image folder
+test/
