@@ -6,7 +6,6 @@ import faiss
 import json
 import numpy as np
 from transformers import CLIPProcessor, CLIPModel
-import os
 
 class Retriever:
     def __init__(self, index_path="data/index.faiss", metadata_path="data/metadata.json", model_name="patrickjohncyh/fashion-clip"):
@@ -23,6 +22,7 @@ class Retriever:
             self.model = CLIPModel.from_pretrained(model_name).to(self.device)
             self.processor = CLIPProcessor.from_pretrained(model_name)
         except:
+            print("Fallback to vanilla CLIP in Retriever")
             self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(self.device)
             self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         
@@ -37,12 +37,11 @@ class Retriever:
             return self._compositional_search(query_text, k)
         return self._single_query_search(query_text, k)
 
-    def _single_query_search(self, text, k=5, return_dict=False):
+    def _single_query_search(self, text, k=5):
         """
-        Standard dense retrieval. 
-        Args:
-           return_dict: If True, returns a dict {filename: score} for easier fusion
+        Standard simple search.
         """
+        # Encode
         inputs = self.processor(text=[text], return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
             outputs = self.model.get_text_features(**inputs)
@@ -53,237 +52,119 @@ class Retriever:
         scores, indices = self.index.search(text_emb.astype('float32'), k)
         
         results = []
-        res_dict = {}
         for score, idx in zip(scores[0], indices[0]):
             if idx != -1:
-                item = {
+                results.append({
                     "path": self.metadata[idx]["path"],
                     "filename": self.metadata[idx]["filename"],
                     "score": float(score)
-                }
-                results.append(item)
-                res_dict[item["filename"]] = float(score)
-                
-        if return_dict:
-            return res_dict
+                })
         return results
 
     def _compositional_search(self, text, k=5):
         """
-        Hybrid Search:
-        1. Get Global candidates (match whole query)
-        2. Get candidates for each part
-        3. Fuse scores: GlobalScore + Sum(PartScores)
+        Optimized Hybrid Search:
+        1. Batch encode [Global Query, Part 1, Part 2, ...]
+        2. Batch Search in FAISS
+        3. Efficient Fusion
         """
+        # 1. Parse parts
         text_clean = text.lower().replace(" and ", ",")
         raw_parts = text_clean.split(",")
         parts = [p.strip() for p in raw_parts if p.strip()]
         
-        if len(parts) == 1:
-            return self._single_query_search(parts[0], k)
-            
-        print(f"Refined Hybrid Search. Query: '{text}' -> Parts: {parts}")
+        if len(parts) <= 1:
+            return self._single_query_search(text, k)
+
+        print(f"Batch Optim. Search: '{text}' -> Parts: {parts}")
+
+        # 2. Batch Encode
+        # [Global, Part1, Part2, ...]
+        all_texts = [text] + parts
         
-        # Hyperparameters
+        inputs = self.processor(text=all_texts, return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            outputs = self.model.get_text_features(**inputs)
+        
+        # Normalize
+        embeddings = outputs.cpu().numpy()
+        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings.astype('float32')
+
+        # 3. Batch Search
+        # Global gets less k? No, let's get ample global candidates
         K_GLOBAL = k * 5
-        K_PARTS = k * 10 
-        WEIGHT_GLOBAL = 0.6  # Give significant weight to the global context
-        WEIGHT_PARTS = 0.4   # Weight for individual attributes
+        K_PARTS = k * 10
         
-        # 1. Global Search (Full context)
-        # Fetching more candidates to intersect with parts
-        global_scores = self._single_query_search(text, k=K_GLOBAL, return_dict=True)
+        # We need variable K for global vs parts? FAISS 'search' is fixed k.
+        # Let's just search K_PARTS (larger) for everyone and slice later if needed.
+        D, I = self.index.search(embeddings, K_PARTS)
         
-        # 2. Part Search
-        part_scores_list = []
-        for p in parts:
-            p_scores = self._single_query_search(p, k=K_PARTS, return_dict=True)
-            part_scores_list.append(p_scores)
-            
-        # 3. Fusion
-        # We consider the union of all candidates
-        all_candidates = set(global_scores.keys())
-        for ps in part_scores_list:
-            all_candidates.update(ps.keys())
-            
-        final_scores = []
+        # D[0], I[0] -> Global results
+        # D[1], I[1] -> Part 1 results
+        # ...
+
+        # 4. Efficient Fusion
+        # Weights
+        WEIGHT_GLOBAL = 0.6
+        WEIGHT_PARTS = 0.4
         
-        for fname in all_candidates:
-            # Base score from global (if not present, maybe small penalty or 0)
-            g_score = global_scores.get(fname, 0.0)
-            
-            # Sum of parts
-            p_score_sum = 0.0
-            matches_count = 0
-            for ps in part_scores_list:
-                if fname in ps:
-                    p_score_sum += ps[fname]
-                    matches_count += 1
-            
-            # Normalize part score by number of parts? 
-            # Or just sum? Sum rewards matching MORE parts.
-            # Average might penalize if one part is missing but others are strong.
-            # Let's use Sum but scaled.
-            
-            # Boost if it matches ALL parts?
-            completeness_boost = 1.0
-            if matches_count == len(parts):
-                completeness_boost = 1.2
-            
-            # Final Formula
-            # We want images that match the global description AND contain the parts.
-            # If an image is not in global candidates but is in parts, it might be good.
-            # If an image is in global but not in parts, it might be missing details.
-            
-            # Hybrid Score
-            total_score = (g_score * WEIGHT_GLOBAL) + (p_score_sum * WEIGHT_PARTS / len(parts))
-            total_score *= completeness_boost
-            
-            # Retrieve path (inefficient loop, optimize later)
-            # Find path in metadata or cache? 
-            # We need to find the path again.
-            path = ""
-            # Search in index mapping logic... wait, we only have limited info.
-            # Let's assume we can scan our temporary results to find the path.
-            # This is slow but correct for this assignment.
-            found = False
-            
-            # Look in global results first
-            # (Requires global_scores to store path too, but we simplified return_dict to just scores)
-            # Let's re-find path from the original lists.
-            # Not saving path in return_dict was a mistake for retrieval speed, but fine for prototype.
-            
-            # Helper to find path in result lists
-            # We need to keep the full objects.
-            pass
+        # Map: filename -> {global_score: float, part_matches: int, part_score_sum: float, path: str}
+        candidates = {}
         
-        # Quick fix: Re-run fusion with full objects
-        # Map fname -> obj
-        fname_to_obj = {}
+        # Helper to process results
+        def add_candidate(idx_list, score_list, is_global=False):
+            for i, score in zip(idx_list, score_list):
+                if i == -1: continue
+                
+                fname = self.metadata[i]["filename"]
+                fpath = self.metadata[i]["path"]
+                
+                if fname not in candidates:
+                    candidates[fname] = {
+                        "global_score": 0.0,
+                        "part_matches": 0,
+                        "part_score_sum": 0.0,
+                        "path": fpath
+                    }
+                
+                if is_global:
+                    candidates[fname]["global_score"] = float(score)
+                else:
+                    candidates[fname]["part_matches"] += 1
+                    candidates[fname]["part_score_sum"] += float(score)
+
+        # Process Global (Row 0)
+        # Slice to K_GLOBAL if we want strictly fewer, but more data is fine.
+        add_candidate(I[0], D[0], is_global=True)
         
-        # Collect objects from global
-        g_results = self._single_query_search(text, k=K_GLOBAL, return_dict=False)
-        for item in g_results:
-            fname_to_obj[item['filename']] = item
+        # Process Parts (Rows 1..N)
+        for row_idx in range(1, len(all_texts)):
+            add_candidate(I[row_idx], D[row_idx], is_global=False)
             
-        # Collect objects from parts
-        for p in parts:
-            p_res = self._single_query_search(p, k=K_PARTS, return_dict=False)
-            for item in p_res:
-                if item['filename'] not in fname_to_obj:
-                    fname_to_obj[item['filename']] = item
-                    
-        # Score calculation again
-        candidates = []
-        for fname, obj in fname_to_obj.items():
-            g_score = 0.0
-            # Check global list
-            for item in g_results:
-                if item['filename'] == fname:
-                    g_score = item['score']
-                    break
-            
-            p_score_sum = 0.0
-            matches = 0
-            for p in parts:
-                # We need to search again? No, we should have cached the scores.
-                # Doing search inside loop is bad.
-                # Let's assume we call _single_query_search again is okay (cached models)?
-                # No, we already ran it. We need the scores from the earlier runs.
-                pass
-            
-        # Refactored Clean Implementation below
+        # 5. Score & Sort
+        final_list = []
+        num_parts = len(parts)
         
-        # 1. Global
-        g_res = self._single_query_search(text, k=K_GLOBAL)
-        g_map = {x['filename']: x['score'] for x in g_res}
-        
-        # 2. Parts
-        p_maps = []
-        for p in parts:
-            res = self._single_query_search(p, k=K_PARTS)
-            p_maps.append({x['filename']: x['score'] for x in res})
-            
-        # 3. Fuse
-        all_fnames = set(g_map.keys())
-        for pm in p_maps:
-            all_fnames.update(pm.keys())
-            
-        scored_candidates = []
-        for fname in all_fnames:
-            score_g = g_map.get(fname, 0.0)
-            
-            score_p_sum = 0.0
-            matches = 0
-            for pm in p_maps:
-                if fname in pm:
-                    val = pm[fname]
-                    score_p_sum += val
-                    matches += 1
+        for fname, data in candidates.items():
+            g = data["global_score"]
+            p_avg = data["part_score_sum"] / num_parts if num_parts > 0 else 0
             
             # Boost
             boost = 1.0
-            if matches == len(parts):
+            if data["part_matches"] == num_parts:
                 boost = 1.15
             
-            # Weighted average
-            # If len(parts) is large, sum grows, so divide.
-            final_score = (score_g * WEIGHT_GLOBAL) + ((score_p_sum / len(parts)) * WEIGHT_PARTS)
+            final_score = (g * WEIGHT_GLOBAL) + (p_avg * WEIGHT_PARTS)
             final_score *= boost
             
-            scored_candidates.append({
+            final_list.append({
+                "path": data["path"],
                 "filename": fname,
                 "score": final_score
             })
             
-        # Sort
-        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
-        top_k = scored_candidates[:k]
+        # Sort desc
+        final_list.sort(key=lambda x: x["score"], reverse=True)
         
-        # Resolve Paths
-        final_objects = []
-        for item in top_k:
-            fname = item["filename"]
-            # Look up path from our object cache
-            # We need to find the path in our metadata.
-            # Using loop over metadata is O(N), slow.
-            # But we have 'fname_to_obj' from before? No, let's just find it in the search results we got.
-            
-            path = None
-            # Check global results
-            for x in g_res:
-                if x["filename"] == fname:
-                    path = x["path"]
-                    break
-            
-            if not path:
-                # Check part results (we need to re-fetch part results effectively)
-                # Since we didn't save the full objects for parts in step 2...
-                # We should have.
-                pass
-                
-        # To avoid re-running, let's keep a map of fname -> path during the scoring phase
-        path_map = {}
-        for x in g_res: 
-            path_map[x['filename']] = x['path']
-            
-        # We need to iterate parts again to populate path_map for items ONLY in parts
-        for p in parts:
-             res = self._single_query_search(p, k=K_PARTS) # This is cached/fast enough? 
-             # Actually we ran it in step 2 but discarded the list. 
-             # Let's fix the implementation to store it.
-             for x in res:
-                 path_map[x['filename']] = x['path']
-
-        final_objects = []
-        for item in top_k:
-            fname = item["filename"]
-            if fname in path_map:
-                final_objects.append({
-                    "path": path_map[fname],
-                    "filename": fname,
-                    "score": item["score"]
-                })
-                
-        return final_objects
-
+        return final_list[:k]
